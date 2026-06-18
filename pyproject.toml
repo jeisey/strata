@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strata-etl"
+version = "0.1.0"
+description = "A layered, signature-routed ETL framework for ingesting spreadsheets and CSVs that change shape over time."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "jeisey", email = "jeisey91@gmail.com" }]
+keywords = [
+    "etl",
+    "elt",
+    "spreadsheet",
+    "excel",
+    "csv",
+    "data-engineering",
+    "schema-evolution",
+    "medallion",
+    "staging",
+    "ingestion",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Office/Business",
+]
+dependencies = []
+
+[project.optional-dependencies]
+excel = ["openpyxl>=3.0"]
+dev = ["pytest>=7.0", "openpyxl>=3.0", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/jeisey/riddle-game"
+Repository = "https://github.com/jeisey/riddle-game"
+Issues = "https://github.com/jeisey/riddle-game/issues"
+
+[project.scripts]
+strata = "strata.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# UP (pyupgrade) is intentionally omitted: we keep Optional/Union so runtime
+# type aliases (e.g. `PathLike = Union[str, Path]`) stay valid on Python 3.9.
+select = ["E", "F", "I", "B"]
