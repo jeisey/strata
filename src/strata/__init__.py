@@ -44,7 +44,7 @@ from .pipeline import IngestResult, Pipeline, ProcessResult
 from .readers import Sheet, read_file, register_reader, supported_extensions
 from .registry import HandlerRegistry
 from .schema import StructuredBlob, infer_column_type, infer_value_type
-from .storage import SQLiteStorage, Storage
+from .storage import DuckDBStorage, SQLiteStorage, Storage
 
 __version__ = "0.1.0"
 
@@ -57,6 +57,7 @@ __all__ = [
     # storage
     "Storage",
     "SQLiteStorage",
+    "DuckDBStorage",
     # registry + output
     "HandlerRegistry",
     "OutputWriter",
