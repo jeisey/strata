@@ -14,9 +14,11 @@ the strongest guarantees about the data it produces.
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 from .hashing import content_hash, header_signature, new_guid
 from .models import Blob, Route, Signature, SourceFile
@@ -92,6 +94,10 @@ class Pipeline:
         self.hash_lower = hash_lower
         self.hash_strip = hash_strip
         self.skip_duplicate_files = skip_duplicate_files
+        # Guards the duplicate-check-then-register critical section so that
+        # concurrent ingests (see :meth:`ingest_many`) of byte-identical files
+        # register exactly one source rather than racing past the dedup check.
+        self._ingest_lock = threading.Lock()
         self.storage.initialize()
 
     # ------------------------------------------------------------------ #
@@ -115,20 +121,25 @@ class Pipeline:
         chash = content_hash(raw)
 
         skip = self.skip_duplicate_files if skip_duplicate is None else skip_duplicate
-        if skip:
-            existing = self.storage.find_sources_by_content_hash(chash)
-            if existing:
-                return IngestResult(source=existing[0], skipped_duplicate=True)
+        # The dedup check and the source insert form one critical section: under
+        # concurrent ingestion two byte-identical files would otherwise both pass
+        # the check and both register.  Holding the lock only for this fast index
+        # write keeps the expensive parse below fully parallel across threads.
+        with self._ingest_lock:
+            if skip:
+                existing = self.storage.find_sources_by_content_hash(chash)
+                if existing:
+                    return IngestResult(source=existing[0], skipped_duplicate=True)
 
-        source = SourceFile(
-            source_id=new_guid(),
-            path=str(p.resolve()),
-            original_filename=p.name,
-            content_hash=chash,
-            byte_size=len(raw),
-            extra=extra or {},
-        )
-        self.storage.add_source_file(source)
+            source = SourceFile(
+                source_id=new_guid(),
+                path=str(p.resolve()),
+                original_filename=p.name,
+                content_hash=chash,
+                byte_size=len(raw),
+                extra=extra or {},
+            )
+            self.storage.add_source_file(source)
 
         blobs: list[Blob] = []
         new_signatures: list[str] = []
@@ -150,6 +161,65 @@ class Pipeline:
                     new_signatures.append(_signature.signature_hash)
 
         return IngestResult(source=source, blobs=blobs, new_signatures=new_signatures)
+
+    def ingest_many(
+        self,
+        paths: Iterable[PathLike],
+        *,
+        max_workers: Optional[int] = None,
+        extra: Optional[dict[str, Any]] = None,
+        skip_duplicate: Optional[bool] = None,
+        compute_signatures: bool = True,
+    ) -> list[IngestResult]:
+        """Ingest many files concurrently -- one worker thread per file.
+
+        The heavy, parallelisable work (reading bytes, parsing each sheet, and
+        inferring schema) runs across a :class:`~concurrent.futures.ThreadPoolExecutor`,
+        while every database write is serialised by the storage backend's
+        internal lock.  That combination is what makes concurrent ingestion safe
+        against the single-connection threading constraints of both SQLite and
+        DuckDB: no database locks, no write-write conflicts, no lost rows.
+
+        Parameters
+        ----------
+        paths:
+            The files to ingest.  Consumed eagerly into a list so results can be
+            returned in the original order.
+        max_workers:
+            Thread-pool size.  ``None`` lets the executor pick a sensible default.
+        extra / skip_duplicate / compute_signatures:
+            Forwarded to :meth:`ingest` for every file.
+
+        Returns
+        -------
+        list[IngestResult]
+            One result per input path, in the same order as ``paths``.  A failure
+            ingesting any single file propagates (fail-fast), mirroring
+            :meth:`ingest`.
+        """
+        path_list = list(paths)
+        if not path_list:
+            return []
+
+        # Distinct-index assignment from worker threads is safe (CPython list
+        # item stores don't resize the list), and lets us preserve input order
+        # regardless of completion order.
+        results: list[Optional[IngestResult]] = [None] * len(path_list)
+
+        def _run(index: int, path: PathLike) -> None:
+            results[index] = self.ingest(
+                path,
+                extra=extra,
+                skip_duplicate=skip_duplicate,
+                compute_signatures=compute_signatures,
+            )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_run, i, p) for i, p in enumerate(path_list)]
+            for future in as_completed(futures):
+                future.result()  # surface any worker exception
+
+        return [r for r in results if r is not None]
 
     # ------------------------------------------------------------------ #
     # Layer 2: signatures

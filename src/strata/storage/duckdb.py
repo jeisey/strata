@@ -1,29 +1,50 @@
-"""SQLite implementation of the :class:`Storage` interface.
+"""DuckDB implementation of the :class:`Storage` interface.
 
-This is the default "staging database".  It needs nothing beyond the Python
-standard library and works equally well as an on-disk file or an in-memory
-store (``":memory:"``) for tests.
+An *analytical* staging backend.  Where
+:class:`~strata.storage.sqlite.SQLiteStorage` is the zero-dependency default,
+DuckDB brings columnar, OLAP-friendly storage that scales to far larger output
+tables while speaking standard SQL.
+
+DuckDB enforces stricter typing than SQLite (which is dynamically typed), so the
+schema below pins explicit column types -- ``BIGINT`` for byte sizes, ``INTEGER``
+for the small counts, ``TEXT`` for ids/JSON payloads.  The shapes otherwise
+mirror the SQLite schema one-for-one so the two backends are interchangeable.
+
+Thread safety
+-------------
+A single DuckDB connection is used and **every** access is serialised through a
+re-entrant lock.  DuckDB's transactional layer would otherwise surface
+write-write conflicts when several threads touch one connection; serialising the
+access turns the store into a safe target for
+:meth:`~strata.pipeline.Pipeline.ingest_many`.  The lock is re-entrant so the
+handful of methods that delegate to one another (e.g. :meth:`fetch_output`) do
+not deadlock.
+
+Install with ``pip install strata-etl[duckdb]``.
 """
 
 from __future__ import annotations
 
-import functools
 import json
-import sqlite3
 import threading
 from dataclasses import asdict
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Optional
 
+from ..exceptions import MissingDependencyError
 from ..models import Blob, ColumnMeta, OutputRecord, Route, Signature, SourceFile, now_iso
 from .base import Storage
 
+# DuckDB is dynamically typed only at the value level; the column types here are
+# enforced on write.  ``BIGINT`` keeps room for large files; the JSON payloads
+# (``extra``, ``data``, ``columns``, ``record``) live in ``TEXT`` columns exactly
+# as they do under SQLite, so the (de)serialisation logic is shared.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_files (
     source_id         TEXT PRIMARY KEY,
     path              TEXT NOT NULL,
     original_filename TEXT NOT NULL,
     content_hash      TEXT NOT NULL,
-    byte_size         INTEGER NOT NULL,
+    byte_size         BIGINT NOT NULL,
     registered_at     TEXT NOT NULL,
     extra             TEXT NOT NULL DEFAULT '{}'
 );
@@ -76,25 +97,6 @@ CREATE INDEX IF NOT EXISTS ix_outputs_source ON outputs(source_id);
 CREATE INDEX IF NOT EXISTS ix_outputs_blob ON outputs(blob_id);
 """
 
-_F = TypeVar("_F", bound=Callable[..., Any])
-
-
-def _synchronized(method: _F) -> _F:
-    """Serialise a method through ``self._lock``.
-
-    SQLite's connection is shared across threads (``check_same_thread=False``),
-    so every operation that touches it must hold the store's re-entrant lock.
-    Re-entrancy keeps delegating methods (``fetch_output`` ->
-    ``fetch_output_records``) from deadlocking.
-    """
-
-    @functools.wraps(method)
-    def wrapper(self: "SQLiteStorage", *args: Any, **kwargs: Any) -> Any:
-        with self._lock:
-            return method(self, *args, **kwargs)
-
-    return wrapper  # type: ignore[return-value]
-
 
 def _columns_to_json(columns: list[ColumnMeta]) -> str:
     return json.dumps([asdict(c) for c in columns])
@@ -104,44 +106,82 @@ def _columns_from_json(raw: str) -> list[ColumnMeta]:
     return [ColumnMeta(**c) for c in json.loads(raw or "[]")]
 
 
-class SQLiteStorage(Storage):
-    """A staging store backed by a single SQLite database.
+class DuckDBStorage(Storage):
+    """A staging store backed by a single DuckDB database.
 
-    Thread safety
-    -------------
-    The single connection is opened with ``check_same_thread=False`` and every
-    access is serialised through a re-entrant lock, so the store is safe to use
-    as the target of :meth:`~strata.pipeline.Pipeline.ingest_many`.  Single
-    threaded behaviour is unchanged -- the lock is simply never contended.
+    Parameters
+    ----------
+    path:
+        Database location.  Defaults to ``":memory:"`` for an ephemeral,
+        in-process store (ideal for tests); pass a filename to persist on disk.
     """
 
     def __init__(self, path: str = ":memory:"):
+        try:
+            import duckdb
+        except ImportError as exc:  # pragma: no cover - exercised only without duckdb
+            raise MissingDependencyError(
+                "the DuckDB backend requires duckdb; install with "
+                "`pip install strata-etl[duckdb]`"
+            ) from exc
+
         self.path = path
-        # ``check_same_thread=False`` lets worker threads share the connection;
-        # the re-entrant lock provides the serialisation SQLite then needs.
+        # Re-entrant so methods that call one another (fetch_output ->
+        # fetch_output_records) can hold the lock without deadlocking, while
+        # cross-thread access is still fully serialised.
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn = duckdb.connect(path)
+
+    # -- helpers -----------------------------------------------------------
+    def _query_all(self, sql: str, params: Optional[list[Any]] = None) -> list[dict[str, Any]]:
+        """Run a SELECT and return rows as dicts keyed by column name."""
+        with self._lock:
+            cur = self._conn.execute(sql, params or [])
+            columns = [d[0] for d in cur.description]
+            return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+    def _query_one(self, sql: str, params: Optional[list[Any]] = None) -> Optional[dict[str, Any]]:
+        """Run a SELECT and return the first row as a dict (or ``None``)."""
+        with self._lock:
+            cur = self._conn.execute(sql, params or [])
+            columns = [d[0] for d in cur.description]
+            row = cur.fetchone()
+            return dict(zip(columns, row)) if row is not None else None
+
+    def _execute(self, sql: str, params: Optional[list[Any]] = None) -> None:
+        """Run a write statement (commit is implicit under DuckDB autocommit)."""
+        with self._lock:
+            self._conn.execute(sql, params or [])
+            self._conn.commit()
+
+    def _affected(self, sql: str, params: Optional[list[Any]] = None) -> int:
+        """Run a DELETE/UPDATE and return the affected row count.
+
+        DuckDB does not populate ``cursor.rowcount`` reliably; instead it yields
+        the affected count as the statement's single-row result.
+        """
+        with self._lock:
+            row = self._conn.execute(sql, params or []).fetchone()
+            self._conn.commit()
+            return int(row[0]) if row else 0
 
     # -- lifecycle ---------------------------------------------------------
-    @_synchronized
     def initialize(self) -> None:
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(_SCHEMA)
+            self._conn.commit()
 
-    @_synchronized
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- Layer 0: source file index ---------------------------------------
-    @_synchronized
     def add_source_file(self, source: SourceFile) -> None:
-        self._conn.execute(
+        self._execute(
             "INSERT INTO source_files "
             "(source_id, path, original_filename, content_hash, byte_size, registered_at, extra) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
+            [
                 source.source_id,
                 source.path,
                 source.original_filename,
@@ -149,31 +189,25 @@ class SQLiteStorage(Storage):
                 source.byte_size,
                 source.registered_at,
                 json.dumps(source.extra),
-            ),
+            ],
         )
-        self._conn.commit()
 
-    @_synchronized
     def get_source_file(self, source_id: str) -> Optional[SourceFile]:
-        row = self._conn.execute(
-            "SELECT * FROM source_files WHERE source_id = ?", (source_id,)
-        ).fetchone()
+        row = self._query_one("SELECT * FROM source_files WHERE source_id = ?", [source_id])
         return self._row_to_source(row) if row else None
 
-    @_synchronized
     def find_sources_by_content_hash(self, content_hash: str) -> list[SourceFile]:
-        rows = self._conn.execute(
-            "SELECT * FROM source_files WHERE content_hash = ? ORDER BY rowid", (content_hash,)
-        ).fetchall()
+        rows = self._query_all(
+            "SELECT * FROM source_files WHERE content_hash = ? ORDER BY rowid", [content_hash]
+        )
         return [self._row_to_source(r) for r in rows]
 
-    @_synchronized
     def list_source_files(self) -> list[SourceFile]:
-        rows = self._conn.execute("SELECT * FROM source_files ORDER BY rowid").fetchall()
+        rows = self._query_all("SELECT * FROM source_files ORDER BY rowid")
         return [self._row_to_source(r) for r in rows]
 
     @staticmethod
-    def _row_to_source(row: sqlite3.Row) -> SourceFile:
+    def _row_to_source(row: dict[str, Any]) -> SourceFile:
         return SourceFile(
             source_id=row["source_id"],
             path=row["path"],
@@ -185,14 +219,13 @@ class SQLiteStorage(Storage):
         )
 
     # -- Layer 1: raw blobs ------------------------------------------------
-    @_synchronized
     def add_blob(self, blob: Blob) -> None:
-        self._conn.execute(
+        self._execute(
             "INSERT INTO blobs "
             "(blob_id, source_id, sheet_name, sheet_index, n_rows, n_cols, data, "
             " signature_hash, created_at, processed_at, processed_by, process_status) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
+            [
                 blob.blob_id,
                 blob.source_id,
                 blob.sheet_name,
@@ -205,16 +238,13 @@ class SQLiteStorage(Storage):
                 blob.processed_at,
                 blob.processed_by,
                 blob.process_status,
-            ),
+            ],
         )
-        self._conn.commit()
 
-    @_synchronized
     def get_blob(self, blob_id: str) -> Optional[Blob]:
-        row = self._conn.execute("SELECT * FROM blobs WHERE blob_id = ?", (blob_id,)).fetchone()
+        row = self._query_one("SELECT * FROM blobs WHERE blob_id = ?", [blob_id])
         return self._row_to_blob(row) if row else None
 
-    @_synchronized
     def list_blobs(
         self,
         *,
@@ -237,19 +267,14 @@ class SQLiteStorage(Storage):
             clauses.append("process_status = ?")
             params.append(status)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        rows = self._conn.execute(
-            f"SELECT * FROM blobs {where} ORDER BY rowid", params
-        ).fetchall()
+        rows = self._query_all(f"SELECT * FROM blobs {where} ORDER BY rowid", params)
         return [self._row_to_blob(r) for r in rows]
 
-    @_synchronized
     def set_blob_signature(self, blob_id: str, signature_hash: str) -> None:
-        self._conn.execute(
-            "UPDATE blobs SET signature_hash = ? WHERE blob_id = ?", (signature_hash, blob_id)
+        self._execute(
+            "UPDATE blobs SET signature_hash = ? WHERE blob_id = ?", [signature_hash, blob_id]
         )
-        self._conn.commit()
 
-    @_synchronized
     def mark_blob_processed(
         self,
         blob_id: str,
@@ -258,15 +283,14 @@ class SQLiteStorage(Storage):
         handler_name: Optional[str] = None,
         processed_at: Optional[str] = None,
     ) -> None:
-        self._conn.execute(
+        self._execute(
             "UPDATE blobs SET process_status = ?, processed_by = ?, processed_at = ? "
             "WHERE blob_id = ?",
-            (status, handler_name, processed_at or now_iso(), blob_id),
+            [status, handler_name, processed_at or now_iso(), blob_id],
         )
-        self._conn.commit()
 
     @staticmethod
-    def _row_to_blob(row: sqlite3.Row) -> Blob:
+    def _row_to_blob(row: dict[str, Any]) -> Blob:
         return Blob(
             blob_id=row["blob_id"],
             source_id=row["source_id"],
@@ -283,39 +307,35 @@ class SQLiteStorage(Storage):
         )
 
     # -- Layer 2: signatures ----------------------------------------------
-    @_synchronized
     def upsert_signature(self, signature: Signature) -> None:
-        self._conn.execute(
+        self._execute(
             "INSERT INTO signatures "
             "(signature_hash, header, n_columns, columns, first_seen_at, sample_blob_id) "
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(signature_hash) DO UPDATE SET "
             "  columns = excluded.columns, sample_blob_id = excluded.sample_blob_id",
-            (
+            [
                 signature.signature_hash,
                 json.dumps(signature.header),
                 signature.n_columns,
                 _columns_to_json(signature.columns),
                 signature.first_seen_at,
                 signature.sample_blob_id,
-            ),
+            ],
         )
-        self._conn.commit()
 
-    @_synchronized
     def get_signature(self, signature_hash: str) -> Optional[Signature]:
-        row = self._conn.execute(
-            "SELECT * FROM signatures WHERE signature_hash = ?", (signature_hash,)
-        ).fetchone()
+        row = self._query_one(
+            "SELECT * FROM signatures WHERE signature_hash = ?", [signature_hash]
+        )
         return self._row_to_signature(row) if row else None
 
-    @_synchronized
     def list_signatures(self) -> list[Signature]:
-        rows = self._conn.execute("SELECT * FROM signatures ORDER BY rowid").fetchall()
+        rows = self._query_all("SELECT * FROM signatures ORDER BY rowid")
         return [self._row_to_signature(r) for r in rows]
 
     @staticmethod
-    def _row_to_signature(row: sqlite3.Row) -> Signature:
+    def _row_to_signature(row: dict[str, Any]) -> Signature:
         return Signature(
             signature_hash=row["signature_hash"],
             header=json.loads(row["header"]),
@@ -326,22 +346,17 @@ class SQLiteStorage(Storage):
         )
 
     # -- Layer 3: routes ---------------------------------------------------
-    @_synchronized
     def set_route(self, route: Route) -> None:
-        self._conn.execute(
+        self._execute(
             "INSERT INTO routes (signature_hash, handler_name, created_at, note) "
             "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(signature_hash) DO UPDATE SET "
             "  handler_name = excluded.handler_name, note = excluded.note",
-            (route.signature_hash, route.handler_name, route.created_at, route.note),
+            [route.signature_hash, route.handler_name, route.created_at, route.note],
         )
-        self._conn.commit()
 
-    @_synchronized
     def get_route(self, signature_hash: str) -> Optional[Route]:
-        row = self._conn.execute(
-            "SELECT * FROM routes WHERE signature_hash = ?", (signature_hash,)
-        ).fetchone()
+        row = self._query_one("SELECT * FROM routes WHERE signature_hash = ?", [signature_hash])
         if not row:
             return None
         return Route(
@@ -351,9 +366,8 @@ class SQLiteStorage(Storage):
             note=row["note"],
         )
 
-    @_synchronized
     def list_routes(self) -> list[Route]:
-        rows = self._conn.execute("SELECT * FROM routes ORDER BY rowid").fetchall()
+        rows = self._query_all("SELECT * FROM routes ORDER BY rowid")
         return [
             Route(
                 signature_hash=r["signature_hash"],
@@ -364,30 +378,25 @@ class SQLiteStorage(Storage):
             for r in rows
         ]
 
-    @_synchronized
     def delete_route(self, signature_hash: str) -> bool:
-        cur = self._conn.execute(
-            "DELETE FROM routes WHERE signature_hash = ?", (signature_hash,)
-        )
-        self._conn.commit()
-        return cur.rowcount > 0
+        return self._affected(
+            "DELETE FROM routes WHERE signature_hash = ?", [signature_hash]
+        ) > 0
 
     # -- Layer 4: outputs --------------------------------------------------
-    @_synchronized
     def add_output(self, record: OutputRecord) -> None:
-        self._conn.execute(
+        self._execute(
             "INSERT INTO outputs (output_id, table_name, blob_id, source_id, record, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (
+            [
                 record.output_id,
                 record.table_name,
                 record.blob_id,
                 record.source_id,
                 json.dumps(record.record),
                 record.created_at,
-            ),
+            ],
         )
-        self._conn.commit()
 
     def fetch_output(
         self,
@@ -396,11 +405,11 @@ class SQLiteStorage(Storage):
         source_id: Optional[str] = None,
         blob_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        return [r.record for r in self.fetch_output_records(
-            table_name, source_id=source_id, blob_id=blob_id
-        )]
+        return [
+            r.record
+            for r in self.fetch_output_records(table_name, source_id=source_id, blob_id=blob_id)
+        ]
 
-    @_synchronized
     def fetch_output_records(
         self,
         table_name: str,
@@ -417,9 +426,7 @@ class SQLiteStorage(Storage):
             clauses.append("blob_id = ?")
             params.append(blob_id)
         where = " AND ".join(clauses)
-        rows = self._conn.execute(
-            f"SELECT * FROM outputs WHERE {where} ORDER BY rowid", params
-        ).fetchall()
+        rows = self._query_all(f"SELECT * FROM outputs WHERE {where} ORDER BY rowid", params)
         return [
             OutputRecord(
                 output_id=r["output_id"],
@@ -432,25 +439,20 @@ class SQLiteStorage(Storage):
             for r in rows
         ]
 
-    @_synchronized
     def delete_outputs_for_blob(self, blob_id: str) -> int:
-        cur = self._conn.execute("DELETE FROM outputs WHERE blob_id = ?", (blob_id,))
-        self._conn.commit()
-        return cur.rowcount
+        return self._affected("DELETE FROM outputs WHERE blob_id = ?", [blob_id])
 
-    @_synchronized
     def list_output_tables(self) -> list[str]:
-        rows = self._conn.execute(
+        rows = self._query_all(
             "SELECT DISTINCT table_name FROM outputs ORDER BY table_name"
-        ).fetchall()
+        )
         return [r["table_name"] for r in rows]
 
-    @_synchronized
     def count_output(self, table_name: Optional[str] = None) -> int:
         if table_name is None:
-            row = self._conn.execute("SELECT COUNT(*) AS n FROM outputs").fetchone()
+            row = self._query_one("SELECT COUNT(*) AS n FROM outputs")
         else:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM outputs WHERE table_name = ?", (table_name,)
-            ).fetchone()
-        return int(row["n"])
+            row = self._query_one(
+                "SELECT COUNT(*) AS n FROM outputs WHERE table_name = ?", [table_name]
+            )
+        return int(row["n"]) if row else 0

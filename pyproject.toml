@@ -39,7 +39,8 @@ dependencies = []
 
 [project.optional-dependencies]
 excel = ["openpyxl>=3.0"]
-dev = ["pytest>=7.0", "openpyxl>=3.0", "ruff>=0.4"]
+duckdb = ["duckdb>=0.9"]
+dev = ["pytest>=7.0", "openpyxl>=3.0", "duckdb>=0.9", "ruff>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/jeisey/strata"
