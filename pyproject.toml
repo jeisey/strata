@@ -9,7 +9,7 @@ description = "A layered, signature-routed ETL framework for ingesting spreadshe
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "jeisey", email = "jeisey91@gmail.com" }]
+authors = [{ name = "jeisey"}]
 keywords = [
     "etl",
     "elt",
@@ -42,9 +42,9 @@ excel = ["openpyxl>=3.0"]
 dev = ["pytest>=7.0", "openpyxl>=3.0", "ruff>=0.4"]
 
 [project.urls]
-Homepage = "https://github.com/jeisey/riddle-game"
-Repository = "https://github.com/jeisey/riddle-game"
-Issues = "https://github.com/jeisey/riddle-game/issues"
+Homepage = "https://github.com/jeisey/strata"
+Repository = "https://github.com/jeisey/strata"
+Issues = "https://github.com/jeisey/strata/issues"
 
 [project.scripts]
 strata = "strata.cli:main"
