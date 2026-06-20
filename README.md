@@ -99,8 +99,8 @@ pip install "strata-etl[excel]"   # adds .xlsx / .xlsm via openpyxl
 From source:
 
 ```bash
-git clone https://github.com/jeisey/riddle-game
-cd riddle-game
+git clone https://github.com/jeisey/strata
+cd strata
 pip install -e ".[dev]"
 ```
 
